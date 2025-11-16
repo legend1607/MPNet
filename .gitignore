@@ -1,0 +1,10 @@
+*.txt
+*.json
+*.npy
+*.npz
+*.pyc
+*.pt
+*.pth
+*.log
+/results
+/data
