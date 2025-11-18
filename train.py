@@ -1,235 +1,205 @@
-#!/usr/bin/env python3
-"""
-train_mlp_with_encoder.py
-
-训练 MLP 来预测下一步点（步长 + theta/phi 方向），使用预训练 CAE encoder 提供环境 embedding。
-输入 npz 必须包含字段：env_grids / path / start / goal / sample_envid
-"""
-import os, argparse, logging, numpy as np
-from tqdm import tqdm
+import os
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
+import torch.optim as optim
+from torch.utils.data import DataLoader, Dataset
 from torch.utils.tensorboard import SummaryWriter
+import numpy as np
 
-from MPNet.AE.cae_2d import Encoder_CNN_2D
-from MPNet.model import MLPPathPredictor
-
-# ----------------------------
-# Dataset
-# ----------------------------
-class PathDatasetFromNPZ(Dataset):
-    def __init__(self, npz_file, num_sector_theta=8, num_sector_phi=16):
-        self.num_sector_theta = num_sector_theta
-        self.num_sector_phi = num_sector_phi
-
+# -------------------------------
+# Dataset with mask
+# -------------------------------
+class PathDataset(Dataset):
+    def __init__(self, npz_file):
         data = np.load(npz_file, allow_pickle=True)
-        self.env_grids = data['env_grids']
-        self.paths = data['path']
-        self.start = data['start']
-        self.goal = data['goal']
-        self.sample_envid = data['sample_envid']
+        self.grids = data['grids']       # (N,H,W)
+        self.starts = data['start']      # (N,2)
+        self.goals = data['goal']        # (N,2)
+        self.paths = data['paths']       # (N,max_len,2)
+        self.masks = data['masks']       # (N,max_len)
 
-        self.max_len = max([len(p) for p in self.paths])
+        self.samples = []
+        for i in range(len(self.paths)):
+            path = self.paths[i]         # (max_len,2)
+            mask = self.masks[i]         # (max_len,)
+            start = self.starts[i]
+            goal = self.goals[i]
+            grid = self.grids[i]
 
-        self.dataset, self.norms, self.theta_idx, self.phi_idx, self.masks = [], [], [], [], []
-
-        for path in self.paths:
-            L = len(path)
-            inp = np.zeros((self.max_len, path.shape[1]), dtype=np.float32)
-            inp[:L] = path
-            if L < self.max_len:
-                inp[L:] = path[-1]
-
-            mask = np.zeros(self.max_len, dtype=np.float32)
-            mask[:L-1] = 1.0
-
-            theta = np.zeros(self.max_len, dtype=np.int64)
-            phi = np.zeros(self.max_len, dtype=np.int64)
-            norm = np.zeros(self.max_len, dtype=np.float32)
-
-            for k in range(L-1):
-                diff = path[k+1]-path[k]
-                r = np.linalg.norm(diff)
-                norm[k] = r
-
-                # 防止 r=0
-                t = 0.0 if r == 0 else np.arccos(np.clip(diff[-1]/r, -1.0, 1.0))
-                p = np.arctan2(diff[1], diff[0])
-
-                # 离散化并 clip
-                theta_idx = int(np.degrees(t)//(180/self.num_sector_theta))
-                phi_idx = int(np.degrees(p)//(360/self.num_sector_phi) + self.num_sector_phi//2)
-
-                theta[k] = np.clip(theta_idx, 0, self.num_sector_theta-1)
-                phi[k] = np.clip(phi_idx, 0, self.num_sector_phi-1)
-
-            # 填充末尾，保持最后有效值
-            if L < self.max_len:
-                theta[L:] = theta[L-1]
-                phi[L:] = phi[L-1]
-                norm[L:] = norm[L-1]
-
-            self.dataset.append(inp)
-            self.masks.append(mask)
-            self.norms.append(norm)
-            self.theta_idx.append(theta)
-            self.phi_idx.append(phi)
-
-        self.dataset = np.array(self.dataset, dtype=np.float32)
-        self.norms = np.array(self.norms, dtype=np.float32)
-        self.theta_idx = np.array(self.theta_idx, dtype=np.int64)
-        self.phi_idx = np.array(self.phi_idx, dtype=np.int64)
-        self.masks = np.array(self.masks, dtype=np.float32)
+            for t in range(len(path)-1):
+                if mask[t+1] == 0:
+                    continue
+                sample = {
+                    'grid': grid.astype(np.float32),
+                    'current_pos': path[t].astype(np.float32),
+                    'next_pos': path[t+1].astype(np.float32),
+                    'start_pos': start.astype(np.float32),
+                    'goal_pos': goal.astype(np.float32),
+                    'mask': float(mask[t+1])
+                }
+                sample['prev_pos'] = path[t-1].astype(np.float32) if t>0 else path[t].astype(np.float32)
+                self.samples.append(sample)
 
     def __len__(self):
-        return len(self.dataset)
+        return len(self.samples)
 
     def __getitem__(self, idx):
+        s = self.samples[idx]
         return {
-            'input': torch.from_numpy(self.dataset[idx]),
-            'mask': torch.from_numpy(self.masks[idx]),
-            'norm': torch.from_numpy(self.norms[idx]),
-            'orient_theta': torch.from_numpy(self.theta_idx[idx]),
-            'orient_phi': torch.from_numpy(self.phi_idx[idx]),
-            'start': torch.from_numpy(self.start[idx]),
-            'goal': torch.from_numpy(self.goal[idx]),
-            'env_grid': torch.from_numpy(self.env_grids[self.sample_envid[idx]])
+            'grid': torch.from_numpy(s['grid']).float(),
+            'current_pos': torch.from_numpy(s['current_pos']).float(),
+            'next_pos': torch.from_numpy(s['next_pos']).float(),
+            'start_pos': torch.from_numpy(s['start_pos']).float(),
+            'goal_pos': torch.from_numpy(s['goal_pos']).float(),
+            'prev_pos': torch.from_numpy(s['prev_pos']).float(),
+            'mask': torch.tensor(s['mask'], dtype=torch.float32)
         }
 
-# ----------------------------
-# Training
-# ----------------------------
-def train(args):
-    os.makedirs(args.save_dir, exist_ok=True)
-    logging.basicConfig(filename=os.path.join(args.save_dir,'train.log'),
-                        level=logging.INFO, format='%(asctime)s %(message)s')
-    log = lambda s: (print(s), logging.info(s))
-    writer = SummaryWriter(log_dir=os.path.join(args.save_dir,"tensorboard"))
+# -------------------------------
+# 导入模型
+# -------------------------------
+from MPNet.AE.cae_2d import Encoder_CNN_2D
+from MPNet.model import MLP
 
-    device = torch.device("cuda" if torch.cuda.is_available() and not args.force_cpu else "cpu")
-    log(f"Using device: {device}")
+# -------------------------------
+# 超参数
+# -------------------------------
+train_npz = 'data.random_2d.train.npz'
+val_npz   = 'data.random_2d.val.npz'
+latent_dim = 28
+batch_size = 64
+num_epochs = 200
+learning_rate = 1e-3
+dt = 0.1
 
-    # Dataset
-    train_ds = PathDatasetFromNPZ(args.train_npz, args.num_sector_theta, args.num_sector_phi)
-    val_ds = PathDatasetFromNPZ(args.val_npz, args.num_sector_theta, args.num_sector_phi)
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True)
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False)
-    log(f"Loaded train={len(train_ds)}, val={len(val_ds)}")
+v_max = 0.1
+a_max = 0.5
+lambda_v = 0.1
+lambda_a = 0.1
+alpha_nll = 0.3
+beta_goal = 0.5
 
-    # CAE Encoder
-    encoder = Encoder_CNN_2D(input_size=train_ds.env_grids.shape[1], latent_dim=args.latent_dim)
-    state = torch.load(args.encoder_ckpt, map_location="cpu")
-    if isinstance(state, dict) and "state_dict" in state: state = state["state_dict"]
-    encoder.load_state_dict(state)
-    encoder.to(device).eval()
-    for p in encoder.parameters(): p.requires_grad = False
-    log("Loaded CAE encoder (frozen)")
+save_dir = './models'
+os.makedirs(save_dir, exist_ok=True)
 
-    # MLP
-    mlp_input_dim = args.latent_dim + train_ds.dataset.shape[2]*2
-    mlp = MLPPathPredictor(input_size=mlp_input_dim,
-                           num_sector_theta=args.num_sector_theta,
-                           num_sector_phi=args.num_sector_phi,
-                           dropout_p=args.dropout_p).to(device)
+# -------------------------------
+# Dataset & DataLoader
+# -------------------------------
+train_ds = PathDataset(train_npz)
+val_ds   = PathDataset(val_npz)
+train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=4)
+val_loader   = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=4)
 
-    optimizer = torch.optim.Adam(mlp.parameters(), lr=args.lr)
-    best_val_loss = float('inf')
+# -------------------------------
+# Encoder CAE
+# -------------------------------
+encoder = Encoder_CNN_2D(mask_size=train_ds.grids.shape[1], latent_dim=latent_dim).cuda()
+encoder_ckpt = 'encoder_ckpt.pth'
+encoder.load_state_dict(torch.load(encoder_ckpt))
+encoder.eval()
+for p in encoder.parameters():
+    p.requires_grad = False
 
-    # Training loop
-    for epoch in range(1, args.epochs+1):
-        mlp.train()
-        running_loss = 0.0
-        for batch in tqdm(train_loader, desc=f"Epoch {epoch}"):
-            mask = batch['mask'].to(device)
-            norm_target = batch['norm'].to(device)
-            theta_target = batch['orient_theta'].to(device)
-            phi_target = batch['orient_phi'].to(device)
-            start = batch['start'].to(device)
-            goal = batch['goal'].to(device)
-            env_grid = batch['env_grid'].to(device).unsqueeze(1)
+# -------------------------------
+# MLP_with_uncertainty
+# -------------------------------
+mlp_input_dim = latent_dim + 4
+mlp = MLP(input_size=mlp_input_dim).cuda()
+optimizer = optim.Adagrad(mlp.parameters(), lr=learning_rate)
 
-            with torch.no_grad():
-                obs_latent, _ = encoder(env_grid)
+# -------------------------------
+# TensorBoard
+# -------------------------------
+writer = SummaryWriter(log_dir=os.path.join(save_dir, "tensorboard"))
 
-            B,L,_ = batch['input'].shape
-            start_goal = torch.cat([start, goal], dim=-1).unsqueeze(1).repeat(1,L,1)
-            mlp_input = torch.cat([obs_latent.unsqueeze(1).repeat(1,L,1), start_goal], dim=-1)
+# -------------------------------
+# 训练循环
+# -------------------------------
+for epoch in range(num_epochs):
+    mlp.train()
+    epoch_loss = 0.0
 
-            optimizer.zero_grad()
-            out_norm, out_theta_raw, out_phi_raw = mlp(mlp_input)
+    for batch in train_loader:
+        grids = batch['grid'].unsqueeze(1).cuda()
+        current_pos = batch['current_pos'].cuda()
+        goal_pos    = batch['goal_pos'].cuda()
+        next_pos    = batch['next_pos'].cuda()
+        prev_pos    = batch['prev_pos'].cuda()
+        mask        = batch['mask'].unsqueeze(1).cuda()  # (B,1)
 
-            loss_norm = ((out_norm.squeeze(-1)-norm_target)**2 * mask).sum() / mask.sum()
-            loss_theta = nn.CrossEntropyLoss(reduction='none')(out_theta_raw.view(-1, args.num_sector_theta), theta_target.view(-1))
-            loss_theta = (loss_theta.view_as(mask)*mask).sum()/mask.sum()
-            loss_phi = nn.CrossEntropyLoss(reduction='none')(out_phi_raw.view(-1, args.num_sector_phi), phi_target.view(-1))
-            loss_phi = (loss_phi.view_as(mask)*mask).sum()/mask.sum()
-            loss = loss_norm + args.k2_theta*loss_theta + args.k2_phi*loss_phi
-
-            loss.backward()
-            optimizer.step()
-            running_loss += loss.item()
-
-        avg_train_loss = running_loss/len(train_loader)
-        log(f"[Epoch {epoch}] train_loss={avg_train_loss:.6f}")
-        writer.add_scalar("train_loss", avg_train_loss, epoch)
-
-        # Validation
-        mlp.eval()
-        val_loss = 0.0
         with torch.no_grad():
-            for batch in val_loader:
-                mask = batch['mask'].to(device)
-                norm_target = batch['norm'].to(device)
-                theta_target = batch['orient_theta'].to(device)
-                phi_target = batch['orient_phi'].to(device)
-                start = batch['start'].to(device)
-                goal = batch['goal'].to(device)
-                env_grid = batch['env_grid'].to(device).unsqueeze(1)
+            latent, _ = encoder(grids)
 
-                obs_latent, _ = encoder(env_grid)
-                B,L,_ = batch['input'].shape
-                start_goal = torch.cat([start, goal], dim=-1).unsqueeze(1).repeat(1,L,1)
-                mlp_input = torch.cat([obs_latent.unsqueeze(1).repeat(1,L,1), start_goal], dim=-1)
+        mlp_input = torch.cat([latent, current_pos, goal_pos], dim=1)
+        mu, sigma = mlp(mlp_input)
 
-                out_norm, out_theta_raw, out_phi_raw = mlp(mlp_input)
-                loss_norm = ((out_norm.squeeze(-1)-norm_target)**2 * mask).sum()/mask.sum()
-                loss_theta = nn.CrossEntropyLoss(reduction='none')(out_theta_raw.view(-1, args.num_sector_theta), theta_target.view(-1))
-                loss_theta = (loss_theta.view_as(mask)*mask).sum()/mask.sum()
-                loss_phi = nn.CrossEntropyLoss(reduction='none')(out_phi_raw.view(-1, args.num_sector_phi), phi_target.view(-1))
-                loss_phi = (loss_phi.view_as(mask)*mask).sum()/mask.sum()
-                val_loss += (loss_norm + args.k2_theta*loss_theta + args.k2_phi*loss_phi).item()
+        # --- 弱监督 NLL ---
+        nll_loss = 0.5 * ((next_pos - mu)/sigma)**2 + torch.log(sigma[:,0]*sigma[:,1])
+        nll_loss = (nll_loss * mask).sum() / mask.sum()
 
-        avg_val_loss = val_loss/len(val_loader)
-        log(f"[Epoch {epoch}] val_loss={avg_val_loss:.6f}")
-        writer.add_scalar("val_loss", avg_val_loss, epoch)
+        # --- 速度/加速度约束 ---
+        vel = (mu - current_pos) / dt
+        acc = (mu - 2*current_pos + prev_pos) / (dt**2)
+        vel_loss = torch.mean(torch.relu(torch.norm(vel, dim=1) - v_max)**2 * mask.squeeze())
+        acc_loss = torch.mean(torch.relu(torch.norm(acc, dim=1) - a_max)**2 * mask.squeeze())
 
-        if avg_val_loss < best_val_loss:
-            best_val_loss = avg_val_loss
-            torch.save(mlp.state_dict(), os.path.join(args.save_dir,"mlp_best.pt"))
-            log(f"Saved best model at epoch {epoch} with val_loss={best_val_loss:.6f}")
+        # --- 终点约束 ---
+        goal_mask = mask.squeeze()
+        goal_loss = torch.mean(torch.norm(goal_pos - mu, dim=1)**2 * goal_mask)
 
-    writer.close()
-    log("Training finished.")
+        # --- 总损失 ---
+        loss = alpha_nll * nll_loss + lambda_v * vel_loss + lambda_a * acc_loss + beta_goal * goal_loss
 
-# ----------------------------
-# Argparse
-# ----------------------------
-if __name__=="__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--train_npz', type=str, default='data/random_2d/train.npz')
-    parser.add_argument('--val_npz', type=str, default='data/random_2d/val.npz')
-    parser.add_argument('--encoder_ckpt', type=str, default='results/cae/encoder_best.pth')
-    parser.add_argument('--save_dir', type=str, default='./results')
-    parser.add_argument('--latent_dim', type=int, default=256)
-    parser.add_argument('--num_sector_theta', type=int, default=8)
-    parser.add_argument('--num_sector_phi', type=int, default=16)
-    parser.add_argument('--dropout_p', type=float, default=0.1)
-    parser.add_argument('--batch_size', type=int, default=16)
-    parser.add_argument('--lr', type=float, default=1e-4)
-    parser.add_argument('--epochs', type=int, default=200)
-    parser.add_argument('--k2_theta', type=float, default=4.0)
-    parser.add_argument('--k2_phi', type=float, default=4.0)
-    parser.add_argument('--force_cpu', action='store_true')
-    args = parser.parse_args()
-    train(args)
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        epoch_loss += loss.item()
+
+    avg_epoch_loss = epoch_loss / len(train_loader)
+    print(f"[Epoch {epoch+1}/{num_epochs}] Train Loss: {avg_epoch_loss:.6f}")
+    writer.add_scalar('Loss/train', avg_epoch_loss, epoch+1)
+
+    # -------------------------------
+    # 验证
+    # -------------------------------
+    mlp.eval()
+    val_loss = 0.0
+    with torch.no_grad():
+        for batch in val_loader:
+            grids = batch['grid'].unsqueeze(1).cuda()
+            current_pos = batch['current_pos'].cuda()
+            goal_pos    = batch['goal_pos'].cuda()
+            next_pos    = batch['next_pos'].cuda()
+            prev_pos    = batch['prev_pos'].cuda()
+            mask        = batch['mask'].unsqueeze(1).cuda()
+
+            latent, _ = encoder(grids)
+            mlp_input = torch.cat([latent, current_pos, goal_pos], dim=1)
+            mu, sigma = mlp(mlp_input)
+
+            nll_loss = 0.5 * ((next_pos - mu)/sigma)**2 + torch.log(sigma[:,0]*sigma[:,1])
+            nll_loss = (nll_loss * mask).sum() / mask.sum()
+
+            vel = (mu - current_pos) / dt
+            acc = (mu - 2*current_pos + prev_pos) / (dt**2)
+            vel_loss = torch.mean(torch.relu(torch.norm(vel, dim=1) - v_max)**2 * mask.squeeze())
+            acc_loss = torch.mean(torch.relu(torch.norm(acc, dim=1) - a_max)**2 * mask.squeeze())
+
+            goal_mask = mask.squeeze()
+            goal_loss = torch.mean(torch.norm(goal_pos - mu, dim=1)**2 * goal_mask)
+
+            loss = alpha_nll * nll_loss + lambda_v * vel_loss + lambda_a * acc_loss + beta_goal * goal_loss
+            val_loss += loss.item()
+
+    avg_val_loss = val_loss / len(val_loader)
+    writer.add_scalar('Loss/val', avg_val_loss, epoch+1)
+    print(f"[Epoch {epoch+1}/{num_epochs}] Val Loss: {avg_val_loss:.6f}")
+
+    # -------------------------------
+    # 保存模型
+    # -------------------------------
+    if (epoch+1) % 50 == 0:
+        torch.save(mlp.state_dict(), os.path.join(save_dir, f'mlp_epoch_{epoch+1}.pth'))
+
+torch.save(mlp.state_dict(), os.path.join(save_dir, 'mlp_final.pth'))
+writer.close()
