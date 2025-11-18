@@ -28,6 +28,69 @@ class MLP(nn.Module):
         sigma = torch.exp(out[:, 2:])  # ensure positivity
         return mu, sigma
     
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class MLP_branch(nn.Module):
+    def __init__(self, input_size, output_size, hidden_sizes=None, dropout_rate=0.5):
+        super().__init__()
+        if hidden_sizes is None:
+            hidden_sizes = [512, 256, 128]
+        layers = []
+        in_size = input_size
+        for h in hidden_sizes:
+            layers.append(nn.Linear(in_size, h))
+            layers.append(nn.PReLU())
+            layers.append(nn.Dropout(dropout_rate))
+            in_size = h
+        layers.append(nn.Linear(in_size, output_size))
+        self.fc = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.fc(x)
+
+
+class MLP_fusion_gaussian(nn.Module):
+    """
+    输出 (num_candidates, joint_dim) 的 μ 和 σ
+    """
+    def __init__(self, cae_input_size, joint_input_size,
+                 fusion_hidden_sizes=None, branch_hidden_sizes=None,
+                 joint_dim=2, num_candidates=5, dropout_rate=0.5):
+        super().__init__()
+        self.num_candidates = num_candidates
+        self.joint_dim = joint_dim
+        
+        self.cae_branch = MLP_branch(cae_input_size, 128, branch_hidden_sizes, dropout_rate)
+        self.joint_branch = MLP_branch(joint_input_size, 128, branch_hidden_sizes, dropout_rate)
+        
+        if fusion_hidden_sizes is None:
+            fusion_hidden_sizes = [256, 128]
+
+        layers = []
+        in_size = 128 * 2
+        for h in fusion_hidden_sizes:
+            layers.append(nn.Linear(in_size, h))
+            layers.append(nn.PReLU())
+            layers.append(nn.Dropout(dropout_rate))
+            in_size = h
+        
+        layers.append(nn.Linear(in_size, num_candidates * joint_dim * 2))
+        self.fc_fusion = nn.Sequential(*layers)
+    
+    def forward(self, cae_input, joint_input):
+        F_e = self.cae_branch(cae_input)
+        F_j = self.joint_branch(joint_input)
+
+        F_cat = torch.cat([F_e, F_j], dim=-1)
+        out = self.fc_fusion(F_cat)
+
+        out = out.view(out.size(0), self.num_candidates, self.joint_dim, 2)
+        mu = out[..., 0]
+        sigma = F.softplus(out[..., 1]) + 1e-6
+        return mu, sigma
 
 class MLP_original(nn.Module):
     def __init__(self, input_size, output_size, hidden_sizes=None, dropout_rate=0.5):
@@ -51,3 +114,4 @@ class MLP_original(nn.Module):
 
     def forward(self, x):
         return self.fc(x)
+    

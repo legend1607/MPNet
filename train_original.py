@@ -10,14 +10,16 @@ from tqdm import tqdm
 # -------------------------------
 # Dataset for single-step training
 # -------------------------------
-class PathDatasetSingleStep(Dataset):
-    def __init__(self, npz_path):
-        data = np.load(npz_path)
+class PathDataset(Dataset):
+    def __init__(self, npz_path, normalize=True, grid_size=160):
+        data = np.load(npz_path, allow_pickle=True)
         self.grids = data['grids']          # [num_env, H, W]
         self.sample_envid = data['sample_envid']
         self.paths = data['paths']          # [num_samples, max_len, 2]
         self.masks = data['masks']          # [num_samples, max_len]
         self.goal = data['goal']            # [num_samples, 2]
+        self.normalize = normalize
+        self.grid_size = grid_size          # 栅格尺寸，用于归一化
 
         # Flatten each path into single-step samples
         self.samples = []
@@ -44,6 +46,13 @@ class PathDatasetSingleStep(Dataset):
         current_pos = s['current_pos'].astype(np.float32)
         next_pos = s['next_pos'].astype(np.float32)
         goal_pos = s['goal_pos'].astype(np.float32)
+
+        # 归一化到 [0,1]
+        if self.normalize:
+            current_pos = current_pos / self.grid_size
+            next_pos = next_pos / self.grid_size
+            goal_pos = goal_pos / self.grid_size
+
         return {
             'grid': torch.from_numpy(grid),          # H, W
             'current_pos': torch.from_numpy(current_pos),  # 2
@@ -61,8 +70,8 @@ def train_single_step(args):
     # -------------------------------
     # Load Dataset
     # -------------------------------
-    train_ds = PathDatasetSingleStep(args.train_npz)
-    val_ds = PathDatasetSingleStep(args.val_npz)
+    train_ds = PathDataset(args.train_npz)
+    val_ds = PathDataset(args.val_npz)
 
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
                               num_workers=args.workers, pin_memory=True)
@@ -185,12 +194,12 @@ def train_single_step(args):
 class Args:
     train_npz = "data/random_2d/train.npz"
     val_npz = "data/random_2d/val.npz"
-    encoder_ckpt = "results/cae/encoder_best.pth"
+    encoder_ckpt = "models/cae/encoder_best.pth"
     save_dir = "results/pointgen_single_step"
     batch_size = 64
-    epochs = 50
-    lr = 1e-5
-    workers = 0
+    epochs = 100
+    lr = 1e-4
+    workers = 4
     checkpoint_every = 10
 
 if __name__ == '__main__':

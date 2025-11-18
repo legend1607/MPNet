@@ -7,6 +7,11 @@ from torch.utils.tensorboard import SummaryWriter
 import numpy as np
 
 # -------------------------------
+# 导入模型
+# -------------------------------
+from MPNet.AE.cae_2d import Encoder_CNN_2D
+from MPNet.model import MLP
+# -------------------------------
 # Dataset with mask
 # -------------------------------
 class PathDataset(Dataset):
@@ -55,11 +60,6 @@ class PathDataset(Dataset):
             'mask': torch.tensor(s['mask'], dtype=torch.float32)
         }
 
-# -------------------------------
-# 导入模型
-# -------------------------------
-from MPNet.AE.cae_2d import Encoder_CNN_2D
-from MPNet.model import MLP
 
 # -------------------------------
 # 超参数

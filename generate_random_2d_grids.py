@@ -46,10 +46,10 @@ def add_random_obstacles(env, num_boxes_range=(2, 10), box_size_range=(2, 5)):
 # ----------------------------
 def generate_dataset(
     num_envs=100,
-    env_dims=(20, 20),
+    env_dims=(224, 224),
     resolution=0.1,
     num_boxes_range=(2, 10),
-    box_size_range=(10, 24),
+    box_size_range=(10, 25),
     save_path="grids.npy"
 ):
     grids = []
@@ -74,6 +74,6 @@ if __name__ == "__main__":
         env_dims=(224, 224),
         resolution=1,
         num_boxes_range=(2, 15),
-        box_size_range=(5, 24),
+        box_size_range=(5, 25),
         save_path="data/random_2d/grids_val.npy"
     )
