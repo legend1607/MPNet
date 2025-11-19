@@ -56,6 +56,10 @@ class PathDataset(Dataset):
         path = self.paths[env_id]
         curr = torch.tensor(path[t], dtype=torch.float32)
         nxt = torch.tensor(path[t+1], dtype=torch.float32)
+        MAX_COORD = 224.0
+        curr = curr / MAX_COORD
+        nxt  = nxt / MAX_COORD
+        g    = g / MAX_COORD
 
         return latent, s, g, curr, nxt
 
